@@ -46,6 +46,10 @@ Import-Module Scripts -Function Send-Email -ErrorAction SilentlyContinue
 $lastSendEmail = Join-Path $logFolder "lastSendEmail"
 $treshold = 30
 
+# if runs as SYSTEM, it is being run on separate MGM server
+# if runs as user, MGM server == computer where repository is managed == PERSONAL INSTALLATION TYPE
+$runningAsSYSTEM = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+
 # UNC path to (DFS) share, where repository data for clients are stored and therefore processed content will be copied
 $repository = "__REPLACEME__1" # UNC path to DFS repository (ie.: \\myDomain\dfs\repository)
 
@@ -166,7 +170,8 @@ function _exportScripts2Module {
             throw "Path $scriptFolder is not accessible"
         }
 
-        $modulePath = Join-Path $moduleFolder ((Split-Path $moduleFolder -Leaf) + ".psm1")
+        $moduleName = Split-Path $moduleFolder -Leaf
+        $modulePath = Join-Path $moduleFolder "$moduleName.psm1"
         $function2Export = @()
         $alias2Export = @()
         $lastCommitFileContent = @{ }
@@ -265,8 +270,7 @@ function _exportScripts2Module {
 
                         $ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
                         # Class methods have a FunctionDefinitionAst under them as well, but we don't want them.
-                        ($PSVersionTable.PSVersion.Major -lt 5 -or
-                            $ast.Parent -isnot [System.Management.Automation.Language.FunctionMemberAst])
+                        ($PSVersionTable.PSVersion.Major -lt 5 -or ($ast.Parent -isnot [System.Management.Automation.Language.FunctionMemberAst]))
                     }, $false)
 
                 if ($functionDefinition.count -ne 1) {
@@ -326,7 +330,7 @@ function _exportScripts2Module {
                         param([System.Management.Automation.Language.Ast] $ast)
 
                         $ast -is [System.Management.Automation.Language.AttributeAst]
-                    }, $true) | ? { $_.parent.extent.text -match '^param' } | Select-Object -ExpandProperty PositionalArguments | Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue # filter out aliases for function parameters
+                    }, $true) | ? { $_.typeName.name -eq "Alias" -and $_.parent.extent.text -match '^param' } | Select-Object -ExpandProperty PositionalArguments | Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue # filter out aliases for function parameters
 
                 if ($innerAliasDefinition) {
                     $innerAliasDefinition | % {
@@ -385,6 +389,45 @@ function _exportScripts2Module {
 
             "Export-ModuleMember -alias $($alias2Export -join ', ')" | Out-File $modulePath -Append $enc
         }
+
+        #region process module manifest (psd1) file
+        $manifestFile = (Get-ChildItem (Join-Path $scriptFolder "*.psd1") -File).FullName
+
+        if ($manifestFile) {
+            if ($manifestFile.count -eq 1) {
+                try {
+                    Write-Verbose "Processing '$manifestFile' manifest file"
+                    $manifestDataHash = Import-PowerShellDataFile $manifestFile -ErrorAction Stop
+                } catch {
+                    Write-Error "Unable to process manifest file '$manifestFile'.`n`n$_"
+                }
+
+                if ($manifestDataHash) {
+                    # customize manifest data
+                    Write-Verbose "Set manifest RootModule key"
+                    $manifestDataHash.RootModule = "$moduleName.psm1"
+                    Write-Verbose "Set manifest FunctionsToExport key"
+                    $manifestDataHash.FunctionsToExport = $function2Export
+                    Write-Verbose "Set manifest AliasesToExport key"
+                    if ($alias2Export) {
+                        $manifestDataHash.AliasesToExport = $alias2Export
+                    } else {
+                        $manifestDataHash.AliasesToExport = @()
+                    }
+
+                    # create final manifest file
+                    Write-Verbose "Generating module manifest file"
+                    # create empty one and than update it because of the bug https://github.com/PowerShell/PowerShell/issues/5922
+                    New-ModuleManifest -Path (Join-Path $moduleFolder "$moduleName.psd1")
+                    Update-ModuleManifest -Path (Join-Path $moduleFolder "$moduleName.psd1") @manifestDataHash
+                }
+            } else {
+                Write-Warning "Module manifest file won't be processed because more then one were found."
+            }
+        } else {
+            Write-Verbose "No module manifest file found"
+        }
+        #endregion process module manifest (psd1) file
     } # end of _generatePSModule
 
     $scripts2ModuleConfig.GetEnumerator() | % {
@@ -538,7 +581,9 @@ Function _copyFolder {
 function _flattenArray {
     # flattens input in case, that string and arrays are entered at the same time
     param (
-        [array] $inputArray
+        [array] $inputArray,
+
+        [switch] $fqdnToHostname
     )
 
     foreach ($item in $inputArray) {
@@ -548,7 +593,12 @@ function _flattenArray {
                 _flattenArray $item
             } else {
                 # output non-arrays
-                $item
+                if ($fqdnToHostname -and $item -like "*.*") {
+                    # return just hostname part
+                    ($item -split "\.")[0]
+                } else {
+                    $item
+                }
             }
         }
     }
@@ -579,6 +629,13 @@ function _setPermissions {
     # write rights because of TEST installation type on Sandbox VM (cannot be restarted, so computer will never be member of repo_writer i.e. cannot update share content once it is copied)
     if (!($writeUser -match 'SYSTEM')) {
         $writeUser = @($writeUser) + 'SYSTEM'
+    }
+
+    # adding account which runs this script
+    # it is personal repo installation a.k.a. MGM server is the same as repository admin pc
+    # to avoid problems with this solution installer where user is added to repo_writer group, but his token doesn't have this permission yet. Therefore Repo_sync sched. task will fail and so the installation
+    if (!$runningAsSYSTEM) {
+        $writeUser = @($writeUser) + (whoami.exe)
     }
 
     $permissions = @()
@@ -674,12 +731,16 @@ try {
         Set-Location $clonedRepository
         try {
             "$(Get-Date -Format HH:mm:ss) - Pulling newest repository data to $clonedRepository"
+            # to avoid error: fatal: detected dubious ownership in repository
+            $null = _startProcess git -argumentList "config --global --add safe.directory $($clonedRepository -replace "\\","/")"
             # download the latest data from GIT repository without trying to merge or rebase anything
             $result = _startProcess git -argumentList "fetch --all" -outputErr2Std
             if ($result -match "fatal: ") { throw $result }
             # resets the master branch to what you just fetched. The --hard option changes all the files in your working tree to match the files in origin/master
             "$(Get-Date -Format HH:mm:ss) - Discarding local changes"
-            $null = _startProcess git -argumentList "reset --hard origin/master"
+            $defaultBranch = ((git symbolic-ref refs/remotes/origin/HEAD) -split "/")[-1]
+            $result = _startProcess git -argumentList "reset --hard origin/$defaultBranch" -outputErr2Std
+            if ($result -match "fatal: ") { throw $result }
             # delete untracked files and folders (generated modules etc)
             _startProcess git -argumentList "clean -fd"
 
@@ -716,16 +777,24 @@ try {
                 $result = _startProcess git -argumentList "clone --local `"__REPLACEME__2`" `"$clonedRepository`"" -outputErr2Std
             } else {
                 # its URL
-                $acc = Import-Clixml "$PSScriptRoot\login.xml"
-                $l = $acc.UserName
-                $p = $acc.GetNetworkCredential().Password
-                # instead __REPLACEME__ use URL of your company repository (i.e. something like: dev.azure.com/ztrhgf/WUG_show/_git/WUG_show). Final URL will than be something like this: https://altLogin:altPassword@dev.azure.com/ztrhgf/WUG_show/_git/WUG_show)
-                $result = _startProcess git -argumentList "clone `"https://$l`:$p@__REPLACEME__2`" `"$clonedRepository`"" -outputErr2Std
+                if ($runningAsSYSTEM) {
+                    $acc = Import-Clixml "$PSScriptRoot\login.xml"
+                    $l = $acc.UserName
+                    $p = $acc.GetNetworkCredential().Password
+                    # instead __REPLACEME__ use URL of your company repository (i.e. something like: dev.azure.com/ztrhgf/WUG_show/_git/WUG_show). Final URL will than be something like this: https://altLogin:altPassword@dev.azure.com/ztrhgf/WUG_show/_git/WUG_show)
+                    $result = _startProcess git -argumentList "clone `"https://fakeAccount`:$p@__REPLACEME__2`" `"$clonedRepository`"" -outputErr2Std
+                } else {
+                    # running as USER
+                    # this means that separate MGM server doesn't exist and repository processing is made on the same computer where repository is managed (admin computer)
+                    # user credentials will be used instead of repo_puller
+                    $result = _startProcess git -argumentList "clone `"https://__REPLACEME__2`" `"$clonedRepository`"" -outputErr2Std
+                }
             }
+
             if ($result -match "fatal: ") { throw $result }
         } catch {
             Remove-Item $clonedRepository -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
-            _emailAndExit -body "Hi,`nthere was an error when cloning repository.`nError was: $_."
+            _emailAndExit -body "Hi,`nthere was an error when cloning repository.`nError was: $_.`n`nIs password of $l account still valid?"
         }
     }
     #endregion PULL NEWEST CONTENT OF CLOUD GIT REPOSITORY LOCALLY
@@ -929,7 +998,7 @@ try {
                     # limit NTFS rights accordingly
                     $readUserC = $configData.computerName
                     # computer AD accounts end with $
-                    $readUserC = (_flattenArray $readUserC) | % { $_ + "$" }
+                    $readUserC = (_flattenArray $readUserC -fqdnToHostname) | % { $_ + "$" }
                     "       - limiting NTFS permissions on $folderName`n            - access just for: $($readUserC -join ', ')"
                     _setPermissions $folder -readUser $readUserC -writeUser $writeUser
                 } else {
@@ -1000,11 +1069,11 @@ try {
                     Copy-Item $itemPath $repository -Force -ErrorAction Stop
 
                     # in case of profile.ps1 limit NTFS permissions just to computers which should download it
-                    if ($itemName -match "\\profile\.ps1$") {
+                    if ($itemName -match "^profile\.ps1$") {
                         $destProfile = (Join-Path $repository "profile.ps1")
                         if ($_computerWithProfile) {
                             # computer AD accounts end with $
-                            $readUserP = (_flattenArray $_computerWithProfile) | % { $_ + "$" }
+                            $readUserP = (_flattenArray $_computerWithProfile -fqdnToHostname) | % { $_ + "$" }
 
                             "       - limiting NTFS permissions on $destProfile`n            - access just for: $($readUserP -join ', ')"
                             _setPermissions $destProfile -readUser $readUserP -writeUser $writeUser
@@ -1133,7 +1202,7 @@ try {
                     } else {
                         $readUserC = $configData.computerName
                         # computer AD ucty maji $ za svym jmenem, pridam
-                        $readUserC = (_flattenArray $readUserC) | % { $_ + "$" }
+                        $readUserC = (_flattenArray $readUserC -fqdnToHostname) | % { $_ + "$" }
                     }
 
                     "       - limiting NTFS permissions on $folderName`n            - access just for: $($readUserC -join ', ')"

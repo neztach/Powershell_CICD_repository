@@ -67,6 +67,8 @@ function _WarningAndExit {
 }
 
 function _GetFileEncoding {
+    # returns UTF-8 for UTF-8 with Bom and ASCII for UTF-8 encoded files!
+
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $True, ValueFromPipelineByPropertyName = $True)]
@@ -158,13 +160,9 @@ function _getAliasAST {
     }
 
     # aliases defined by [Alias("Some-Alias")]
-    $AST.FindAll( {
-            param([System.Management.Automation.Language.Ast] $AST)
+    $AST.FindAll( { $args[0] -is [System.Management.Automation.Language.AttributeAst] }, $true) | ? { $_.parent.parent.parent.name -eq $functionName -and $_.parent.extent.text -match '^param' } | Select-Object -ExpandProperty PositionalArguments | Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue | % { $alias += $_ }
 
-            $AST -is [System.Management.Automation.Language.AttributeAst]
-        }, $true) | ? { $_.parent.extent.text -match '^param' } | Select-Object -ExpandProperty PositionalArguments | Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue | % { $alias += $_ }
-
-    return $alias
+    return ($alias | Select-Object -Unique)
 }
 
 function _getParameterAST {
@@ -214,7 +212,7 @@ function _getFunctionAST {
             $AST -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
             # Class methods have a FunctionDefinitionAst under them as well, but we don't want them.
             ($PSVersionTable.PSVersion.Major -lt 5 -or
-                $AST.Parent -isnot [System.Management.Automation.Language.FunctionMemberAst])
+            $AST.Parent -isnot [System.Management.Automation.Language.FunctionMemberAst])
         }, $false)
 }
 #endregion helper functions
@@ -595,6 +593,7 @@ try {
     }
 
 
+
     #
     # check that commit doesn't contain any files in root of scripts2module folder
     # such files won't be processed anyway
@@ -603,6 +602,7 @@ try {
     if ($scripts2moduleRootFile) {
         _ErrorAndExit "File(s) $($scripts2moduleRootFile -join ', ') can't be in root of 'scripts2module' folder. To generate module, save the ps1 file containing the same named function as scripts2module\<moduleName>\<function-name>.ps1."
     }
+
 
 
     #
@@ -614,13 +614,13 @@ try {
         $textFilesToCommit | ForEach-Object {
             $fileEnc = (_GetFileEncoding $_).bodyName
             if ($fileEnc -notin "US-ASCII", "ASCII", "UTF-8" ) {
-                _WarningAndExit "File $_ is encoded in '$fileEnc', so git diff wont work.`nIdeal is to save it using UTF-8 with BOM, or UTF-8."
+                _WarningAndExit "File $_ is encoded as '$fileEnc', so git diff wont work.`nIdeal is to save it using UTF-8 with BOM, or UTF-8."
             }
         }
     }
 
 
-    
+
     #
     # various checks of ps1 and psm1 files
     "- check syntax, problematic characters, FIXME, best practices, format, name , changes in function parameters,..."
@@ -716,6 +716,7 @@ try {
                 $scriptUnixPath = $script -replace ([regex]::Escape((Get-Location))) -replace "\\", "/" -replace "^/"
                 $lastCommitContent = _startProcess git "show HEAD:$scriptUnixPath"
                 $prevParameter = ""
+                $prevAlias = ""
                 if (!$lastCommitContent -or $lastCommitContent -match "^fatal: ") {
                     Write-Warning "Previous version of $scriptUnixPath cannot be found (to check modified parameters/aliases)."
                 } else {
@@ -739,6 +740,9 @@ try {
                         _WarningAndExit "Function $functionName which parameters has changed ($($changedParam -join ', ')) is mentioned in following scripts:`n$($fileUsed -join "`n")"
                     }
                 }
+
+                # deleted alias check
+                $deletedAlias = ""
                 if ($prevAlias -and !$actAlias) {
                     $deletedAlias = $prevAlias
                 }
@@ -750,7 +754,7 @@ try {
                         $alias = $_
                         $escFuncName = [regex]::Escape($functionName)
                         $escAlias = [regex]::Escape($alias)
-                        # get all files where changed function is mentioned (even in comments)
+                        # get all files where deleted alias is mentioned (even in comments)
                         $fileUsed = git.exe grep --ignore-case -l "\b$escAlias\b"
                         # exclude scripts where this alias is defined
                         $fileUsed = $fileUsed | Where-Object { $_ -notmatch "/$escFuncName\.ps1" }
@@ -758,9 +762,41 @@ try {
                         if ($fileUsed) {
                             $fileUsed = $fileUsed -replace "/", "\"
 
-                            _WarningAndExit "Alias '$alias' of function $functionName was deleted, but is still used in following scripts:`n$($fileUsed -join "`n")"
+                            _WarningAndExit "Deleted alias '$alias' of the function $functionName is still used in following scripts:`n$($fileUsed -join "`n")"
                         }
                     }
+                }
+
+                # added alias check
+                $addedAlias = ""
+                if ($actAlias -and !$prevAlias) {
+                    $addedAlias = $actAlias
+                }
+                if ($actAlias -and $prevAlias) {
+                    $addedAlias = Compare-Object $actAlias $prevAlias | ? { $_.sideIndicator -eq "<=" } | select -exp inputObject
+                }
+                if ($addedAlias) {
+                    $addedAlias | % {
+                        $alias = $_
+                        $escFuncName = [regex]::Escape($functionName)
+                        $escAlias = [regex]::Escape($alias)
+                        # get all files where added alias is mentioned (even in comments)
+                        $fileUsed = git.exe grep --ignore-case -l "\b$escAlias\b"
+                        # exclude scripts where this alias is defined
+                        $fileUsed = $fileUsed | Where-Object { $_ -notmatch "/$escFuncName\.ps1" }
+
+                        if ($fileUsed) {
+                            $fileUsed = $fileUsed -replace "/", "\"
+
+                            _WarningAndExit "Added alias '$alias' of the function $functionName is already used in following scripts:`n$($fileUsed -join "`n")"
+                        }
+                    }
+                }
+
+                #
+                # error if function defines same named alias
+                if ($actAlias -and ($actAlias | ? { $_ -eq $functionName })) {
+                    _ErrorAndExit "Function $functionName defines same named alias which is nonsense"
                 }
             }
         }
@@ -787,7 +823,7 @@ try {
 
 
     #
-    # warn about deleted ps1 script (that defines function for module generation), in case it is used somewhere in repository
+    # warn about deleted function & alias in case it is used somewhere in repository
     if ($commitedDeletedPs1) {
         $commitedDeletedPs1 = $commitedDeletedPs1 -replace "/", "\"
         $commitedDeletedPs1 | Where-Object { $_ -match "scripts2module\\" } | ForEach-Object {
@@ -801,6 +837,35 @@ try {
                 $fileFuncUsed = $fileFuncUsed -replace "/", "\"
 
                 _WarningAndExit "Deleted function $funcName is mentioned in following scripts:`n$($fileFuncUsed -join "`n")"
+            }
+
+            # get all aliases defined in last function version
+            $functionScriptUnixPath = $_ -replace "\\", "/"
+            $lastCommitContent = _startProcess git "show HEAD:$functionScriptUnixPath"
+            if (!$lastCommitContent -or $lastCommitContent -match "^fatal: ") {
+                Write-Warning "Previous version of function $funcName cannot be found (to check deleted aliases)."
+            } else {
+                $gitAST = [System.Management.Automation.Language.Parser]::ParseInput(($lastCommitContent -join "`n"), [ref]$null, [ref]$null)
+
+                $deletedAlias = _getAliasAST $gitAST $funcName
+            }
+
+            if ($deletedAlias) {
+                $deletedAlias | % {
+                    $alias = $_
+                    $escFuncName = [regex]::Escape($funcName)
+                    $escAlias = [regex]::Escape($alias)
+                    # get all files where changed function is mentioned (even in comments)
+                    $fileUsed = git.exe grep --ignore-case -l "\b$escAlias\b"
+                    # exclude scripts where this alias is defined
+                    $fileUsed = $fileUsed | Where-Object { $_ -notmatch "/$escFuncName\.ps1" }
+
+                    if ($fileUsed) {
+                        $fileUsed = $fileUsed -replace "/", "\"
+
+                        _WarningAndExit "Alias '$alias' of function $funcName was deleted, but is still used in following scripts:`n$($fileUsed -join "`n")"
+                    }
+                }
             }
         }
         #TODO kontrola funkci v profile.ps1? viz AST sekce https://devblogs.microsoft.com/scripting/learn-how-it-pros-can-use-the-powershell-ast/

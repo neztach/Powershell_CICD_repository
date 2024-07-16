@@ -24,7 +24,7 @@
     Default is module, custom and profile i.e. full synchronization should occur.
 
     .PARAMETER moduleToSync
-    Can be used to limit synchronization of Powershell modules, so just subset of them will be synced.
+    Can be used to limit synchronization of PowerShell modules, so just subset of them will be synced.
     Accept list of modules names.
 
     .PARAMETER customToSync
@@ -32,9 +32,9 @@
     Accept list of Custom folder names.
 
     .PARAMETER omitDeletion
-    Switch to omit deletion of unused modules, scheduled tasks, powershell profile or custom folders.
+    Switch to omit deletion of unused modules, scheduled tasks, PowerShell profile or custom folders.
     Use when you want sync cycle to end as fast as possible.
-    
+
     .NOTES
     Author: Ondřej Šebela - ztrhgf@seznam.cz
 #>
@@ -89,13 +89,37 @@ if ($synchronize.count -ne 3 -or $moduleToSync -or $customToSync -or $omitDeleti
 
 $hostname = $env:COMPUTERNAME
 
+# modules etc that wasn't synced successfully
+$failedSync = @()
+
 "$(Get-Date -Format HH:mm:ss) - START synchronizing data from $repository$customized"
 
 #region helper functions
+function _isFilelocked {
+    param ([string] $file)
+
+    if ([System.IO.File]::Exists($file)) {
+        try {
+            $fileStream = [System.IO.File]::Open($file, 'Open', 'Write')
+
+            $fileStream.Close()
+            $fileStream.Dispose()
+
+            return $False
+        } catch [System.UnauthorizedAccessException] {
+            return 'AccessDenied'
+        } catch {
+            return $True
+        }
+    }
+}
+
 function _flattenArray {
     # flattens input in case, that string and arrays are entered at the same time
     param (
-        [array] $inputArray
+        [array] $inputArray,
+
+        [switch] $fqdnToHostname
     )
 
     foreach ($item in $inputArray) {
@@ -105,7 +129,12 @@ function _flattenArray {
                 _flattenArray $item
             } else {
                 # output non-arrays
-                $item
+                if ($fqdnToHostname -and $item -like "*.*") {
+                    # return just hostname part
+                    ($item -split "\.")[0]
+                } else {
+                    $item
+                }
             }
         }
     }
@@ -220,7 +249,7 @@ function _setPermissions {
     #     $SubFolders = Get-ChildItem $Path -Directory
     #     If ($SubFolders) {
     #         Foreach ($SubFolder in $SubFolders) {
-    #             # Start a process rather than a job, icacls should take way less memory than Powershell+icacls
+    #             # Start a process rather than a job, icacls should take way less memory than PowerShell+icacls
     #             Start-Process icacls -WindowStyle Hidden -ArgumentList """$($SubFolder.FullName)"" /Reset /T /C" -PassThru
     #         }
     #     }
@@ -241,9 +270,9 @@ function _copyFolder {
 
     Process {
         if ($mirror) {
-            $result = Robocopy.exe "$source" "$destination" /MIR /E /NFL /NDL /NJH /R:4 /W:5 /XD "$excludeFolder"
+            $result = Robocopy.exe "$source" "$destination" /MIR /E /NFL /NDL /NJH /R:0 /W:0 /XD "$excludeFolder"
         } else {
-            $result = Robocopy.exe "$source" "$destination" /E /NFL /NDL /NJH /R:4 /W:5 /XD "$excludeFolder"
+            $result = Robocopy.exe "$source" "$destination" /E /NFL /NDL /NJH /R:0 /W:0 /XD "$excludeFolder"
         }
 
         $copied = 0
@@ -251,6 +280,8 @@ function _copyFolder {
         $duration = ""
         $deleted = @()
         $errMsg = @()
+
+        $i = 0
 
         $result | ForEach-Object {
             if ($_ -match "\s+Dirs\s+:") {
@@ -273,10 +304,22 @@ function _copyFolder {
             if ($_ -match "^ERROR: ") {
                 $errMsg += ($_ -replace "^ERROR:\s+")
             }
-            # captures errors like: 2020/04/27 09:01:27 ERROR 2 (0x00000002) Accessing Source Directory C:\temp
+            # errors like:
+            #  2022/11/18 07:58:34 ERROR 5 (0x00000005) Copying File C:\temp\test.rtf
+            #  Access is denied.
             if ($match = ([regex]"^[0-9 /]+ [0-9:]+ ERROR \d+ \([0-9x]+\) (.+)").Match($_).captures.groups) {
-                $errMsg += $match[1].value
+                $errorText = $match[1].value -replace "Copying File "
+                $errorDetails = $result[($i + 1)]
+
+                if ($errorDetails -like "*The process cannot access the file because it is being used by another process.*") {
+                    # make error msg shorter
+                    $errMsg += "$errorText - file is in use"
+                } else {
+                    $errMsg += "$errorText - $errorDetails"
+                }
             }
+
+            ++$i
         }
 
         return [PSCustomObject]@{
@@ -313,8 +356,7 @@ function _sendEmailAndContinue {
 
     Send-Email -subject $subject -body $body
 }
-#endregion
-
+#endregion helper functions
 
 
 
@@ -339,12 +381,12 @@ if (("profile" -in $synchronize) -or ("module" -in $synchronize -and !$moduleToS
 
 
 #
-# SYNCHRONIZATION OF POWERSHELL MODULES
+# SYNCHRONIZATION OF PowerShell MODULES
 #
 
-#region sync of powershell modules
+#region sync of PowerShell modules
 if ($synchronize -contains "module") {
-    "$(Get-Date -Format HH:mm:ss) - Synchronization of Powershell Modules"
+    "$(Get-Date -Format HH:mm:ss) - Synchronization of PowerShell Modules"
     $moduleSrcFolder = Join-Path $repository "modules"
     $moduleDstFolder = Join-Path $env:systemroot "System32\WindowsPowerShell\v1.0\Modules\"
 
@@ -354,26 +396,24 @@ if ($synchronize -contains "module") {
 
     $customModulesScript = Join-Path $moduleSrcFolder "modulesConfig.ps1"
 
-    if (!$moduleToSync) {
-        try {
-            " - dot sourcing of modulesConfig.ps1"
-            . $customModulesScript
-        } catch {
-            "   - there was an error when dot sourcing $customModulesScript"
-            "   - error was $_"
-        }
+    try {
+        " - dot sourcing of modulesConfig.ps1"
+        . $customModulesScript
+    } catch {
+        "   - there was an error when dot sourcing $customModulesScript"
+        "   - error was $_"
+    }
 
-        # names of modules, that should be copied just to selected computers
-        $customModules = @()
-        # names of modules, that should be copied just to this computer
-        $thisPCModules = @()
+    # names of modules, that should be copied just to subset of computers
+    $customModules = @()
+    # names of modules, that should be copied just to this computer
+    $thisPCModules = @()
 
-        $modulesConfig | ForEach-Object {
-            $customModules += $_.folderName
+    $modulesConfig | ForEach-Object {
+        $customModules += $_.folderName
 
-            if ($hostname -in (_flattenArray $_.computerName)) {
-                $thisPCModules += $_.folderName
-            }
+        if ($hostname -in (_flattenArray $_.computerName -fqdnToHostname)) {
+            $thisPCModules += $_.folderName
         }
     }
 
@@ -383,38 +423,59 @@ if ($synchronize -contains "module") {
     foreach ($module in (Get-ChildItem $moduleSrcFolder -Directory)) {
         $moduleName = $module.Name
         if ($moduleToSync -and $moduleName -notin $moduleToSync) {
-            "   - skipping module $moduleName (not in moduleToSync)"
+            "   - skipping module $moduleName (not in moduleToSync argument)"
             continue
         }
 
-        if ($moduleName -notin $customModules -or ($moduleName -in $customModules -and $moduleName -in $thisPCModules)) {
+        if ($moduleName -notin $customModules -or $moduleName -in $thisPCModules) {
             # module should be on this computer
             $moduleDstPath = Join-Path $moduleDstFolder $moduleName
+
+            # if some dll file in destination folder is locked, copy cannot be successful, skip it
+            # this often happens for dll(s), because VSC loads them automatically
+            # it seems that robocopy if unable to access file, thinks it was changed hence tries to update it (in mirror mode)
+            if (Test-Path $moduleDstPath -ea SilentlyContinue) {
+                $lockedFile = $null
+
+                foreach ($dll in (Get-ChildItem $moduleDstPath -Recurse -Filter "*.dll")) {
+                    if (_isFilelocked $dll.FullName) {
+                        $lockedFile = $dll.name
+                        break
+                    }
+                }
+
+                if ($lockedFile) {
+                    $failedSync += "module $moduleName"
+                    "   - skipping module $moduleName (file '$lockedFile' is locked)"
+                    continue
+                }
+            }
             try {
                 "   - copying module $moduleName (if necessary)"
 
                 $result = _copyFolder $module.FullName $moduleDstPath -mirror
 
                 if ($result.failures) {
+                    $failedSync += "module $moduleName"
                     # just warn about error, it is likely, that it will end successfully next time (module can be in use etc)
-                    "       - there was an error when copying $($module.FullName)`n$($result.errMsg)"
+                    "       - there was an error when copying $($module.FullName)`n        $($result.errMsg)"
                 }
 
                 if ($result.copied) {
-                    "       - change detected, setting NTFS rights"
+                    "       - change detected (copied $($result.copied) files), setting NTFS rights"
                     _setPermissions $moduleDstPath -readUser $readUser -writeUser $writeUser
                 }
             } catch {
-                "       - there was an error when copying $moduleDstPath, error was`n$_"
+                $failedSync += "module $moduleName"
+                "       - there was an error when copying $moduleDstPath, error was`n        $_"
             }
         } else {
             # module shouldn't be on this computer
-            "   - skipping module $moduleName (shouldn't be here)"
+            "   - skipping module $moduleName (not for this computer)"
         }
     }
 }
-#endregion
-
+#endregion sync of PowerShell modules
 
 
 
@@ -425,12 +486,10 @@ if ($synchronize -contains "module") {
 $commitHistorySrc = Join-Path $repository "commitHistory"
 # copy file with commit history locally
 # so prompt function in profile.ps1 where this file is used to check how much is that console obsolete, will be as fast as possible
-if ((Test-Path $commitHistorySrc -ea SilentlyContinue) -and ($env:COMPUTERNAME -in (_flattenArray $_computerWithProfile))) {
+if ((Test-Path $commitHistorySrc -ea SilentlyContinue) -and ($env:COMPUTERNAME -in (_flattenArray $_computerWithProfile -fqdnToHostname))) {
     [Void][System.IO.Directory]::CreateDirectory($customDstFolder)
     Copy-Item $commitHistorySrc $customDstFolder -Force -Confirm:$false
 }
-
-
 
 
 
@@ -440,7 +499,7 @@ if ((Test-Path $commitHistorySrc -ea SilentlyContinue) -and ($env:COMPUTERNAME -
 
 #region sync of global PS profile
 if ($synchronize -contains "profile") {
-    "$(Get-Date -Format HH:mm:ss) - Synchronization of Powershell Profile"
+    "$(Get-Date -Format HH:mm:ss) - Synchronization of PowerShell Profile"
     $profileSrc = Join-Path $repository "profile.ps1"
     $profileDst = Join-Path $env:systemroot "System32\WindowsPowerShell\v1.0\profile.ps1"
     $profileDstFolder = Split-Path $profileDst -Parent
@@ -448,7 +507,7 @@ if ($synchronize -contains "profile") {
 
     if (Test-Path $profileSrc -ea SilentlyContinue) {
         # DFS share contains profile.ps1
-        if ($env:COMPUTERNAME -in (_flattenArray $_computerWithProfile)) {
+        if ($env:COMPUTERNAME -in (_flattenArray $_computerWithProfile -fqdnToHostname)) {
             # profile.ps1 should be copied to this computer
             if (Test-Path $profileDst -ea SilentlyContinue) {
                 # profile.ps1 already exist on this computer, check whether it differs
@@ -479,14 +538,14 @@ if ($synchronize -contains "profile") {
         }
     } else {
         # in DFS share there is not profile.ps1
-        if ((Test-Path $profileDst -ea SilentlyContinue) -and ($env:COMPUTERNAME -in (_flattenArray $_computerWithProfile)) -and $isOurProfile) {
+        if ((Test-Path $profileDst -ea SilentlyContinue) -and ($env:COMPUTERNAME -in (_flattenArray $_computerWithProfile -fqdnToHostname)) -and $isOurProfile) {
             # profile.ps1 is on this computer and was copied by this script == delete it
             " - deleting $profileDst"
             Remove-Item $profileDst -Force -Confirm:$false
         }
     }
 }
-#endregion
+#endregion sync of global PS profile
 
 
 
@@ -519,9 +578,9 @@ if ($synchronize -contains "custom") {
     $thisPCCustSchedTask = @()
 
     foreach ($custom in $customConfig) {
-        if ($hostname -in (_flattenArray $custom.computerName)) {
+        if ($hostname -in (_flattenArray $custom.computerName -fqdnToHostname)) {
             if ($customToSync -and $customToSync -notcontains $custom.folderName) {
-                " - skipping custom folder {0} (not in customToSync)" -f $custom.folderName
+                " - skipping custom folder {0} (not in customToSync argument)" -f $custom.folderName
                 continue
             }
 
@@ -548,8 +607,8 @@ if ($synchronize -contains "custom") {
 
     #
     # delete Custom folders, that shouldn't be on this computer
-    if (!($omitDeletion -or $customToSync)) {
-        # skip if defined $customToSync, because it modifies content of $thisPCCustFolder
+    if (!$omitDeletion -and !$customToSync -and $synchronize -contains "custom") {
+        # skip if $customToSync is defined, because it modifies $thisPCCustFolder i.e. it would contain just subset of computers Custom folders (not all of them)
         Get-ChildItem $customDstFolder -Directory -ErrorAction SilentlyContinue | ForEach-Object {
             $folder = $_
             if ($folder.name -notin $thisPCCustFolder) {
@@ -761,7 +820,7 @@ if ($synchronize -contains "custom") {
     # delete scheduled tasks that shouldn't be on this computer
     # and was created earlier by this script
     # check just tasks in root, because this script creates them in root
-    if (!$omitDeletion) {
+    if (!$omitDeletion -and $synchronize -contains "custom") {
         $taskInRoot = schtasks /QUERY /FO list | ? { $_ -match "^TaskName:\s+\\[^\\]+$" } | % { $_ -replace "^TaskName:\s+\\" }
         foreach ($taskName in $taskInRoot) {
             if ($taskName -notin $thisPCCustSchedTask) {
@@ -779,23 +838,26 @@ if ($synchronize -contains "custom") {
         } # end of deleting scheduled task section
     }
 }
-#endregion
+#endregion sync of custom content
 
 
 #
-# delete Powershell modules that are no more in DFS share, so shouldn't be on client neither
-# this section is after Custom, so I don't have to dot source customConfig.ps1 twice
-if (!($omitDeletion -or $moduleToSync -or !$synchronize -notcontains "module" -or $customToSync)) {
-    "$(Get-Date -Format HH:mm:ss) - Delete unnecessary Powershell Modules"
-    # skip if some necessary data are missing because of customization of refresh
+# delete PowerShell modules that shouldn't be on this computer
+# this section is after Custom, so I don't have to dot source customConfig.ps1 twice and to have $thisPCCustToModules prepared
+if (!$omitDeletion -and $synchronize -contains "module" -and ($synchronize -contains "custom" -and !$customToSync)) {
+    # Custom section has to be processed, because of getting $thisPCCustToModules and at the same time $customToSync cannot be defined, because it could modify it
+
+    "$(Get-Date -Format HH:mm:ss) - Delete unnecessary PowerShell modules"
+
     if (Test-Path $moduleDstFolder -ea SilentlyContinue) {
-        # save system modules that was copied by this script
+        # get modules that was previously copied by this script
         $repoModuleInDestination = Get-ChildItem $moduleDstFolder -Directory | Get-Acl | Where-Object { $_.accessToString -like "*$readUser*" } | Select-Object -ExpandProperty PSChildName
+
         if ($repoModuleInDestination) {
             $sourceModuleName = @((Get-ChildItem $moduleSrcFolder -Directory).Name)
 
             $repoModuleInDestination | ForEach-Object {
-                if (($sourceModuleName -notcontains $_ -and $thisPCCustToModules -notcontains $_) -or ($customModules -contains $_ -and $thisPCModules -notcontains $_)) {
+                if ((($sourceModuleName -notcontains $_ -and $thisPCCustToModules -notcontains $_) -or ($customModules -contains $_ -and $thisPCModules -notcontains $_))) {
                     " - $_"
                     Remove-Item (Join-Path $moduleDstFolder $_) -Force -Confirm:$false -Recurse
                 }
@@ -804,4 +866,14 @@ if (!($omitDeletion -or $moduleToSync -or !$synchronize -notcontains "module" -o
     }
 }
 
+if ($failedSync) {
+    "`n`n!!!WARNING!!!`nSome content wasn't synchronized:`n$($failedSync | % {"`t- $_`n"})"
+}
+
 "$(Get-Date -Format HH:mm:ss) - END"
+
+if ($failedSync) {
+    # exit with custom code (10000), so CICD repository installation script and refresh function know this isn't serious
+    $host.SetShouldExit(10000)
+    exit
+}

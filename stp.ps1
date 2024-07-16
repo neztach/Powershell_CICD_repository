@@ -34,7 +34,7 @@ Begin {
     $Host.UI.RawUI.WindowTitle = "Installer of PowerShell CI/CD solution"
 
     $transcript = Join-Path $env:USERPROFILE ((Split-Path $PSCommandPath -Leaf) + ".log")
-    Start-Transcript $transcript -Force
+    $null = Start-Transcript $transcript -Force
 
     $ErrorActionPreference = "Stop"
 
@@ -47,6 +47,8 @@ Begin {
     $setupVariable = @{}
     # name of GPO that will be used for connecting computers to this solution
     $GPOname = 'PS_env_set_up'
+
+    $userRepositoryWasntEmpty = $false
 
     # hardcoded PATHs for TEST installation
     $remoteRepository = "$env:SystemDrive\myCompanyRepository_remote"
@@ -200,6 +202,13 @@ Begin {
         if ($passThru) {
             return $value
         }
+    }
+
+    function _unsetVariable {
+        # function defines variable and fills it with value find in ini file or entered by the user
+        param ([string] $variable)
+
+        $setupVariable.$variable = $null
     }
 
 
@@ -378,7 +387,7 @@ Begin {
     }
 
     function _installGIT {
-        $installedGITVersion = ( (Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*) + (Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*) | ? { $_.DisplayName -and $_.Displayname.Contains('Git version') }) | select -ExpandProperty DisplayVersion
+        $installedGITVersion = ( (Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*) + (Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*) | ? { $_.DisplayName -and $_.Displayname -match '^Git' }) | select -ExpandProperty DisplayVersion
 
         if (!$installedGITVersion -or $installedGITVersion -as [version] -lt "2.27.0") {
             # get latest download url for git-for-windows 64-bit exe
@@ -634,10 +643,9 @@ Process {
             - NOTE: Linking GPO has to be done manually.
     - NOTE: Every step has to be explicitly confirmed.
 
-3) Personal installation
+3) PERSONAL installation
     - PURPOSE:
-        - Choose this option, if you want to leverage benefits of CI/CD for your personal PowerShell content.
-        - TIP: Can also be used to share one GIT repository across multiple colleagues even without Active Directory.
+        - Choose this option, if you want to leverage benefits of CI/CD for your personal PowerShell content or to share one GIT repository across multiple colleagues even without Active Directory.
     - REQUIREMENTS:
         - Local Admin rights
         - Existing GIT repository
@@ -652,6 +660,7 @@ Process {
         - Creates required scheduled tasks.
             - Repo_sync
                 - Pulls data from your GIT repository and process them
+                - will be run under your account therefore use your credentials to access GIT repository
             - PS_env_set_up
                 - Synchronizes client with already processed repository data
         - Starts VSC editor with your new repository, so you can start your testing immediately. :)
@@ -716,48 +725,33 @@ Process {
 
     Clear-Host
 
-    if (!$noEnvModification -and !$testInstallation) {
+    if ($personalInstallation -or $testInstallation) {
         @"
 ####################################
-#   BEFORE YOU CONTINUE
+#   INSTALLING REQUIREMENTS
 ####################################
-
-- Create cloud or locally hosted GIT !private! repository (tested with Azure DevOps but probably will work also with GitHub etc).
-   - Create READ only account in that repository (repo_puller).
-       - Create credentials for this account, that can be used in unattended way (i.e. alternate credentials in Azure DevOps).
-   - Clone this repository locally (git clone command).
-
-   - NOTE:
-        - More details can be found at https://github.com/ztrhgf/Powershell_CICD_repository/blob/master/1.%20HOW%20TO%20INSTALL.md
 "@
-
-        _pressKeyToContinue
-    }
-
-    if (!$testInstallation) {
-        Clear-Host
-    } else {
-        ""
-    }
-
-    if ($personalInstallation -or $testInstallation) {
         "   - installing 'GIT'"
         _installGIT
 
         "   - installing 'VSC'"
         _installVSC
 
-        Install-PackageProvider -Name nuget -Force -ForceBootstrap -Scope allusers | Out-Null
+        "   - installing 'Nuget'"
+        if (Get-PackageProvider -Name nuget -ListAvailable -ErrorAction SilentlyContinue | ? Version -GT '2.8.5') {
+            "      - already installed"
+        } else {
+            Install-PackageProvider -Name nuget -Force -ForceBootstrap -Scope allusers | Out-Null
+        }
 
-        # if (!(Get-Module -ListAvailable PSScriptAnalyzer)) {
-        #     "   - installing 'PSScriptAnalyzer' PS module"
-        #     Install-Module PSScriptAnalyzer -SkipPublisherCheck -Force
-        # }
-
-        "   - updating 'PackageManagement' PS module"
         # solves issue https://github.com/PowerShell/vscode-powershell/issues/2824
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Install-Module -Name PackageManagement -Force -ErrorAction SilentlyContinue
+        "   - installing 'PackageManagement' PS module"
+        if (Get-Module PackageManagement -ListAvailable | ? version -GT ([version]'1.4.8')) {
+            "      - already installed"
+        } else {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Install-Module -Name PackageManagement -Force -ErrorAction SilentlyContinue
+        }
 
         if ((Get-ExecutionPolicy -Scope LocalMachine) -notmatch "Bypass|RemoteSigned") {
             # because of PS Global Profile loading
@@ -772,6 +766,44 @@ Process {
 
     if (!$testInstallation) {
         _pressKeyToContinue
+        Clear-Host
+    } else {
+        ""
+    }
+
+    if (!$noEnvModification -and !$testInstallation) {
+        if ($personalInstallation) {
+            @"
+####################################
+#   BEFORE YOU CONTINUE
+####################################
+
+- Create cloud or locally hosted GIT !private! repository (tested with Azure DevOps but probably will work also with GitHub etc).
+- Clone this repository locally (git clone command).
+
+- NOTE:
+    - More details can be found at https://github.com/ztrhgf/Powershell_CICD_repository/blob/master/1.%20HOW%20TO%20INSTALL.md
+"@
+        } else {
+            @"
+####################################
+#   BEFORE YOU CONTINUE
+####################################
+
+- Create cloud or locally hosted GIT !private! repository (tested with Azure DevOps but probably will work also with GitHub etc).
+- Create READ only account in that repository (repo_puller).
+    - Create credentials for this account, that can be used in unattended way (i.e. alternate credentials in Azure DevOps).
+- Clone this repository locally (git clone command).
+
+- NOTE:
+    - More details can be found at https://github.com/ztrhgf/Powershell_CICD_repository/blob/master/1.%20HOW%20TO%20INSTALL.md
+"@
+        }
+
+        _pressKeyToContinue
+    }
+
+    if (!$testInstallation) {
         Clear-Host
     } else {
         ""
@@ -1257,7 +1289,7 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
                 1 = $repositoryShare
                 2 = _setVariable repositoryURL "Cloning URL of your own GIT repository. Will be used on MGM server" -passThru
                 3 = $MGMServer
-                4 = _setVariable computerWithProfile "name of computer(s) (without ending $, divided by comma) that should get:`n       - global Powershell profile (shows number of commits this console is behind in Title etc)`n       - adminFunctions module (Refresh-Console function etc)`n" -passThru
+                4 = _setVariable computerWithProfile "name of computer(s) (without ending $, divided by comma) that should get:`n       - global Powershell profile (shows number of commits this console is behind in Title etc)`n" -passThru
                 5 = _setVariable smtpServer "IP or hostname of your SMTP server. Will be used for sending error notifications (recipient will be specified later)" -optional -passThru
                 6 = _setVariable adminEmail "recipient(s) email address (divided by comma), that should receive error notifications. Use format it@contoso.com" -optional -passThru
                 7 = _setVariable 'from' "sender email address, that should be used for sending error notifications. Use format robot@contoso.com" -optional -passThru
@@ -1269,11 +1301,11 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
             $replacemeVariable = @{
                 1 = $repositoryShare
                 2 = _setVariable repositoryURL "Cloning URL of your own GIT repository." -passThru
-                3 = $MGMServer
-                4 = "####" # will be replaced with real computer name, if user decides to have synchronized PS profile
+                3 = '"$env:COMPUTERNAME"' # there can be more than one computer that will behave like MGM server, therefore sync on them all
+                4 = "##DONOTSYNCPROFILEANYWHERE##" # will be replaced with real computer name, if user decides to have synchronized PS profile
             }
 
-            _setVariable syncPSProfile "Do you want to synchronize Global PowerShell Profile (shows number of commits this console is behind in Title etc) and adminFunctions module (contains Refresh-Console function etc) to this computer?" -YNQuestion
+            _setVariable syncPSProfile "Do you want to synchronize Global PowerShell Profile (shows number of commits this console is behind in Title etc) to this computer?" -YNQuestion
 
             if ($syncPSProfile -eq "Y") {
                 $replacemeVariable.4 = $env:COMPUTERNAME
@@ -1283,7 +1315,7 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
 
             $repositoryURL = $remoteRepository
             $computerWithProfile = $env:COMPUTERNAME
-            Write-Warning "So this computer will get:`n - global Powershell profile (shows number of commits this console is behind in Title etc)`n - adminFunctions module (Refresh-Console function etc)`n"
+            Write-Warning "So this computer will get:`n - global Powershell profile (shows number of commits this console is behind in Title etc)`n"
 
             $replacemeVariable = @{
                 1 = $repositoryShare
@@ -1363,9 +1395,14 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
         if (!$testInstallation) {
             _setVariable userRepository "path to ROOT of your locally cloned repository '$repositoryURL'"
 
-            if (!(Test-Path (Join-Path $userRepository ".git") -ErrorAction SilentlyContinue)) {
-                throw "$userRepository isn't cloned GIT repository (.git folder is missing)"
+            while (!(Test-Path (Join-Path $userRepository ".git") -ErrorAction SilentlyContinue)) {
+                Write-Warning "'$userRepository' isn't cloned GIT repository (hidden '.git' folder is missing)"
+                _unsetVariable userRepository
+                _setVariable userRepository "path to ROOT of your locally cloned repository '$repositoryURL'"
             }
+
+            # make a note whether cloned repository is brand new or was already set up
+            $userRepositoryWasntEmpty = Test-Path "$userRepository\Custom\Repo_Sync\Repo_Sync.ps1" -ErrorAction SilentlyContinue
         } else {
             $userRepository = "$env:SystemDrive\myCompanyRepository"
 
@@ -1386,7 +1423,6 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
         Write-Host "- Copying customized repository data ($repo_content_set_up) to your own repository ($userRepository)" -ForegroundColor Green
 
         if ($testInstallation -or (!$noEnvModification -and !(_skip))) {
-
             $result = _copyFolder $repo_content_set_up $userRepository
             if ($err = $result.errMsg) {
                 throw "Copy failed:`n$err"
@@ -1411,7 +1447,7 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
             $userDomain = "$env:COMPUTERNAME.com"
         }
         Write-Host "- Configuring repository '$userRepository'" -ForegroundColor Green
-        "   - activating GIT Hooks, creating symlink for PowerShell snippets, commiting&pushing changes, etc"
+        "   - activating GIT Hooks, creating symlink for PowerShell snippets, commiting&pushing changes (if new repository), etc"
 
         if ($testInstallation -or (!$noEnvModification -and !(_skip))) {
             $currPath = Get-Location
@@ -1444,9 +1480,16 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
 
             # commit without using hooks, to avoid possible problem with checks (because of wrong encoding, missing PSScriptAnalyzer etc), that could stop it
             "   - commiting & pushing changes to repository $repositoryURL"
-            $null = git add .
-            $null = _startProcess git "commit --no-verify -m initial" -outputErr2Std -dontWait
-            $null = _startProcess git "push --no-verify" -outputErr2Std
+            if ($testInstallation -or !$userRepositoryWasntEmpty) {
+                # user repo was empty before my customized content was copied to it or this is TEST installation
+                # it is safe to automatically do commit&push
+                $null = git add .
+                $null = _startProcess git "commit --no-verify -m initial" -outputErr2Std -dontWait
+                $null = _startProcess git "push --no-verify" -outputErr2Std
+            } else {
+                Write-Warning "Skipped.`n`nYour repository wasn't empty before customized content was copied a.k.a. some of your content could be lost. Check manually changed files (in VSC 'Source Control' tab) and commit&push just safe changes before continue!"
+                _pressKeyToContinue
+            }
 
             "   - activating GIT hooks for automation of checks, git push etc"
             $null = _startProcess git 'config core.hooksPath ".\.githooks"'
@@ -1476,15 +1519,24 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
         $userRepoSync = Join-Path $userRepository "custom\Repo_sync"
         Write-Host "- Setting MGM server ($MGMServer)" -ForegroundColor Green
         if (!$testInstallation) {
-            @"
+            if ($personalInstallation) {
+                @"
    - copy Repo_sync folder to '$MGMRepoSync'
-   - install newest version of 'GIT'
+   - install 'GIT'
+   - create scheduled task 'Repo_sync' from 'Repo_sync.xml'
+
+"@
+            } else {
+                @"
+   - copy Repo_sync folder to '$MGMRepoSync'
+   - install 'GIT'
    - create scheduled task 'Repo_sync' from 'Repo_sync.xml'
    - export 'repo_puller' account alternate credentials to '$MGMRepoSync\login.xml' (only SYSTEM account on $MGMServer will be able to read them!)
    - copy exported credentials from $MGMServer to $userRepoSync
    - commit&push exported credentials (so they won't be automatically deleted from $MGMServer, after this solution starts working)
 
 "@
+            }
         }
 
         if ($testInstallation -or (!$noEnvModification -and !(_skip))) {
@@ -1561,9 +1613,36 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
                 $Repo_syncXML = "$MGMRepoSync\Repo_sync.xml"
                 "   - creating scheduled task '$taskName' from $Repo_syncXML"
 
+                if ($personalInstallation) {
+                    [xml]$Repo_syncXMLContent = Get-Content $Repo_syncXML
+                    # replace SID for the current user ones a.k.a. the sched. task will be run as current user a.k.a. his credentials will be used to clone GIT repository instead of separate repo_puller account
+                    $Repo_syncXMLContent.Task.Principals.Principal.UserId = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+                    $LogonTypeChild = $Repo_syncXMLContent.CreateElement('LogonType', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+                    $null = $Repo_syncXMLContent.Task.Principals.Principal.AppendChild($LogonTypeChild)
+                    if ((whoami.exe) -like "azuread\*") {
+                        # AAD user
+                        # sched. task run under AAD user cannot be set with 'run whether user is logged on or not' option (which I use)
+                        # instead 'run only when user is logged on' has to be used, which is interactive, therefore ps1 script is being run via vbs script to make it hidden
+                        Write-Warning "You are AzureAD user, synchronization will be run only when you will be logged on"
+                        $Repo_syncXMLContent.Task.Actions.Exec.Command = 'wscript.exe'
+                        $Repo_syncXMLContent.Task.Actions.Exec.Arguments = "$MGMRepoSync\run_hidden.vbs $MGMRepoSync\Repo_Sync.ps1 -force"
+                        $Repo_syncXMLContent.Task.Principals.Principal.LogonType = 'InteractiveToken'
+                    } else {
+                        # not an AAD user
+                        $Repo_syncXMLContent.Task.Principals.Principal.LogonType = 'S4U'
+                    }
+                    $Repo_syncXMLContent.save($Repo_syncXML)
+                }
+
                 _createSchedTask -xmlDefinition $Repo_syncXML -taskName $taskName
 
-                if ($ADInstallation -or $personalInstallation) {
+                if ($personalInstallation) {
+                    # this task definition is customized for every repository user, therefore it doesn't make sense to save it into the repository, because no one else can use it
+                    "   - removing scheduled task '$taskName' definition $Repo_syncXML"
+                    Remove-Item $Repo_syncXML -Force
+                }
+
+                if ($ADInstallation) {
                     "   - exporting repo_puller account alternate credentials to '$MGMRepoSync\login.xml' (only SYSTEM account on $env:COMPUTERNAME will be able to read them!)"
                     _exportCred -credential (Get-Credential -Message 'Enter credentials (that can be used in unattended way) for GIT "repo_puller" account, you created earlier') -runAs "NT AUTHORITY\SYSTEM" -xmlPath "$MGMRepoSync\login.xml"
                 }
@@ -1585,12 +1664,9 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
             #endregion configure MGM server
 
             #region copy exported GIT credentials from MGM server to cloned GIT repo & commit them
-            if (!$testInstallation) {
+            if ($ADInstallation) {
                 "   - copying exported credentials from $MGMServer to $userRepoSync"
-                if ($personalInstallation) {
-                    # copy locally
-                    Copy-Item "$MGMRepoSync\login.xml" "$userRepoSync\login.xml" -Force
-                } elseif ($ADInstallation -and $notADAdmin) {
+                if ($notADAdmin) {
                     # copy using previously created PSSession
                     Copy-Item -FromSession $MGMServerSession "C:\Windows\Scripts\Repo_sync\login.xml" -Destination "$userRepoSync\login.xml" -Force
                 } else {
@@ -1654,14 +1730,14 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
             #region PS_env_set_up scheduled task properties preparation
             #region customize parameters of PS_env_set_up.ps1 script that is being run in PS_env_set_up scheduled task
             if ($personalInstallation) {
-                "1 - All"
-                "2 - PowerShell modules"
-                "3 - Custom content"
+                "1 - All (PS profile, modules, custom folders) - RECOMMENDED"
+                "2 - Just PowerShell modules"
+                "3 - Just Custom folders"
                 ""
 
                 $whatToSync = ""
                 while (!($whatToSync -match "^(1|2|3)$")) {
-                    [string[]] $whatToSync = Read-Host "Choose what do you want to have synchronyzing from your GIT repository to this computer"
+                    [string[]] $whatToSync = Read-Host "Choose what you want to allow to be synchronized to this computer"
                 }
 
                 if ($whatToSync -ne 1) {
@@ -1804,12 +1880,13 @@ Your input will be stored to '$iniFile'. So next time you start this script, its
             _startSchedTask $taskName
 
             "      - checking, that the task ends up succesfully"
-            while (($result = ((schtasks /query /tn "$taskName" /v /fo csv /nh) -split ",")[6]) -eq '"267009"') {
+            while (($result = ((schtasks /query /tn "$taskName" /v /fo csv /nh) -split ",")[6] -replace '"') -eq '267009') {
                 # task is running
                 Start-Sleep 1
             }
-            if ($result -ne '"0"') {
-                Write-Error "Task '$taskName' ends up with error ($($result -replace '"')). Check C:\Windows\Temp\PS_env_set_up.ps1.log on $env:COMPUTERNAME for more information"
+            if ($result -ne '0' -and $result -ne '10000') {
+                # custom error code 10000 means something wasn't synchronized (because in use etc), but for installation purposes it can be ignored
+                Write-Error "Task '$taskName' ends up with error $result. Check C:\Windows\Temp\PS_env_set_up.ps1.log on $env:COMPUTERNAME for more information"
             }
         }
         #endregion create GPO that creates PS_env_set_up scheduled task or just the sched. task
@@ -1915,7 +1992,7 @@ ENJOY :)
     } finally {
         Set-Location $PSScriptRoot
 
-        Stop-Transcript -ErrorAction SilentlyContinue
+        $null = Stop-Transcript -ErrorAction SilentlyContinue
 
         try {
             Remove-PSSession -Session $repositoryHostSession
